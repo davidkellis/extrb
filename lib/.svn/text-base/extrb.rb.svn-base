@@ -1,0 +1,205 @@
+require 'enumerator'
+
+class Array
+  def combine(other)
+    retval = Hash.new
+    each_with_index do |obj, i|
+      retval[obj] = other[i]
+    end
+    retval
+  end
+end
+
+class Dir
+  def self.directories(dirname)
+    dirname = File.expand_path("#{dirname}")
+    dirname += File::Separator unless dirname[-1].chr == '/'
+    listing = entries(dirname).reject { |file| file =~ /^(\.|\.\.)$/ || !File.directory?(File.join(dirname, file)) }    #remove the '.' and '..' directories from the listing if they exist
+    listing.collect { |file| "#{dirname}#{file}" }
+  end
+end
+
+module Enumerable
+  class Enumerator
+    def to_gen
+      Generator.new(self)
+    end
+  end
+
+  # This method behaves like map but returns a pair (2-element array) per collection element. Each
+  # pair contains the result of applying the key_f and value_f lambdas on each collection element.
+  #
+  # Returns an array of pairs, each of the form: [key_f.call(elem), value_f.call(elem)]
+  def pmap(key_f, value_f)
+    map { |o| [key_f.call(o), value_f.call(o)] }
+  end
+
+  # Requires Ruby 1.9 for the Enumerator#group_by method
+  #
+  # This method first groups the collection elements into sub-collections. The sub-collections
+  # are determined by the grouping function: *key_f* (a lambda)
+  # After grouping is performed, each sub-collection is reduced to a single value by applying the 
+  # reduce_f lambda on each sub-collection.
+  #
+  # Returns an array of pairs, each of the form: [key_f.call(elem), reduce_f.call(elements_with_same_key_value)]
+  def greduce(key_f, reduce_f)
+    grouped = group_by { |elem| key_f.call(elem) }   #returns a hash
+    reduced = grouped.map { |k, value_array| [k, reduce_f.call(value_array)] }
+  end
+
+=begin
+  # This method allows one to reduce a collection of multi-attribute objects to an aggregate Hash.
+  # The return Hash contains attribute (key)/aggregate (value) pairs containing aggregates of multiple
+  # attributes from the collection of objects.
+  def mreduce(initial=nil, keys, reduce_f, post_reduce_f = nil)
+    aggregate_hash = inject(Hash.new(initial)) do |m,o|
+      for key in keys
+        m[key] = reduce_f.call(m[key], o)
+      end
+    end
+    aggregate_hash = aggregate_hash.map { |key, aggregate| post_reduce_f.call(key, aggregate) } if post_reduce_f
+    aggregate_hash
+  end
+=end
+end
+
+class File
+  class << self
+    # source should be a zip file, target should be a directory to output the contents to.
+    def unzip(source, target = File.dirname(source))
+      # Create the target directory.
+      FileUtils.mkdir_p(target)
+
+      Zip::ZipFile.open(source) do |zipfile|
+        dir = zipfile.dir
+        dir.entries('.').each do |entry|
+          zipfile.extract(entry, File.join(target, entry))
+        end
+      end
+    rescue Zip::ZipDestinationFileExistsError => e
+      # I'm going to ignore this and just overwrite the files.
+    rescue => e
+      puts e
+      puts e.backtrace.join("\n")
+    end
+    
+    def find_r(root_dir, search_pattern, &blk)
+      find(File.join(root_dir, '**', search_pattern), &blk)
+    end
+    
+    def find(search_pattern)
+      if block_given?
+        Dir.glob(search_pattern).each { |f| yield File.expand_path(f) }
+      else
+        Dir.glob(search_pattern).map { |f| File.expand_path(f) }
+      end
+    end
+  end
+end
+
+=begin
+class NilClass
+  def method_missing(name, *args)
+    nil
+  end
+end
+=end
+
+#extension to Object class found at: http://whytheluckystiff.net/articles/seeingMetaclassesClearly.html
+class Object
+  # The hidden singleton lurks behind everyone
+  def metaclass; class << self; self; end; end
+  
+  # similar to class_eval. Executes a block of code within the context of the metaclass of self.
+  # When we implement meta_eval with metaclass.class_eval, we can define instance methods on the singleton class (singleton methods) of the class represented by self like this:
+  #   C.meta_eval { def foo; puts 'foo'; end }     -->     C.foo => outputs "foo\n"
+  # But when we implement meta_eval with metaclass.instance_eval, we define instance methods on the singleton class of the singleton class (singleton methods on the singleton class) of the class represented by self:
+  #   C.meta_eval { def bar; puts 'bar'; end }      -->     C.metaclass.f => outputs "bar\n"     ;    Not C.bar as we may have intended
+  def meta_eval &blk; metaclass.class_eval(&blk); end    #originally, instance_eval instead of class_eval
+  
+  # Adds methods to a metaclass
+  def meta_def name, &blk
+    # we use define_method because it will always create an instance method on the class represented by self. This way, if meta_eval is implemented with either class_eval or instance_eval, the method 
+    # we are defining with our call to meta_def is guaranteed to be defined as an instance method on the metaclass/singleton class.
+    meta_eval { define_method name, &blk }
+  end
+  
+  # Defines an instance method within a class
+  def class_def name, &blk
+    # we use define_method because it will always create an instance method on the class represented by self
+    class_eval { define_method name, &blk }
+  end
+  
+  def enumerator(iterator)
+    Enumerable::Enumerator.new(self, iterator)
+  end
+  
+  def generator(iterator)
+    Generator.new(enumerator(iterator))
+  end
+end
+
+class String
+  def each_match(pattern, resume_at_end_of_match = false)
+    offset = 0
+    while offset = index(pattern, offset)
+      #see http://www.zenspider.com/Languages/Ruby/QuickRef.html
+      #$&         The string matched by the last successful pattern match in this scope.
+      #$`         The string to the left  of the last successful match.
+      #$'         The string to the right of the last successful match.
+      #$1         The Nth group of the last successful match. May be > 1.
+      #$~         The information about the last match in the current scope. A MatchData object.
+      
+      #puts "#{$`}<<#{$&}>>#{$'} - #{$~.offset(0)}"     #print out some debug info on each pattern match
+      yield offset, $~
+      
+      if resume_at_end_of_match
+        offset = $~.offset(0)[1]    #offset(0) returns a 2-element array: [index of the start of the match, index of the character after the end of the match]
+      else
+        offset += 1
+      end
+    end
+    nil
+  end
+  
+  #determines whether a given pattern is found within a number of tokens (words, characters, etc.) before or after a given offset within the string
+  def contain?(pattern, distance, token, position, root_offset, inclusive = false)
+    unit_offset = inclusive ? 1 : 0
+    if position == :before_or_after
+      if (offset = rindex(pattern, root_offset)) && slice(offset, root_offset - offset + unit_offset).scan(token).length <= distance
+        return offset
+      end
+      if (offset = index(pattern, root_offset)) && slice(root_offset, offset - root_offset + unit_offset).scan(token).length <= distance
+        return offset
+      end
+    elsif position == :before
+      if (offset = rindex(pattern, root_offset)) && slice(offset, root_offset - offset + unit_offset).scan(token).length <= distance
+        return offset
+      end
+    elsif position == :after
+      if (offset = index(pattern, root_offset)) && slice(root_offset, offset - root_offset + unit_offset).scan(token).length <= distance
+        return offset
+      end
+    end
+    false
+  end
+  
+  def segment(*indices)
+    retval = Array.new
+    indices = indices.flatten.push(0, length).uniq.select(&lambda {|i| i >= 0 && i <= length }).sort
+    i = indices.shift
+    indices.each do |j|
+      retval << slice(i...j)
+      i = j
+    end
+    retval
+  end
+end
+
+class Symbol
+	def to_proc
+    #we use Proc.new instead of lambda because lambda returns a Proc objects that checks the number of parameters passed when called.
+    #Proc.new returns a Proc object that doesn't perform a check on the number of parameters passed when the Proc is called. ActiveSupport requires that the check not be done.
+    Proc.new { |*args| args.shift.__send__(self, *args) }
+	end
+end
